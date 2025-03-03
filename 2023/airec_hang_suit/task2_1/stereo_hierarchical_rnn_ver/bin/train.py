@@ -1,0 +1,329 @@
+#
+# Copyright (c) 2023 Ogata Laboratory, Waseda University
+#
+# Released under the AGPL license.
+# see https://www.gnu.org/licenses/agpl-3.0.txt
+#
+
+import os
+import sys
+import numpy as np
+import matplotlib.pyplot as plt
+import json
+import argparse
+from tqdm import tqdm
+import torch.optim as optim
+from collections import OrderedDict
+import torch
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+# from torch.utils.tensorboard import SummaryWriter
+sys.path.append("/home/fujita/work/eipl")
+from eipl.utils import EarlyStopping, check_args, set_logdir
+from eipl.utils import normalization, resize_img, cos_interpolation
+
+try:
+    from libs.model import StereoHierarchicalRNN
+    from libs.utils import MultimodalDataset
+    from libs.trainer import fullBPTTtrainer
+except:
+    sys.path.append("./libs/")
+    from model import StereoHierarchicalRNN
+    from utils import MultimodalDataset
+    from trainer import fullBPTTtrainer
+
+
+# argument parser
+parser = argparse.ArgumentParser(
+    description="Learning spatial autoencoder with recurrent neural network"
+)
+parser.add_argument("--model", type=str, default="stereo_hierarchical_rnn")
+parser.add_argument("--epoch", type=int, default=1000)
+parser.add_argument("--batch_size", type=int, default=1)
+
+parser.add_argument("--srnn_hid_dim", type=int, default=30)
+parser.add_argument("--urnn_hid_dim", type=int, default=20)
+
+parser.add_argument("--img_loss", type=float, default=0.1)
+parser.add_argument("--key_point_loss", type=float, default=0.1)
+parser.add_argument("--joint_loss", type=float, default=1.0)
+parser.add_argument("--cmd_loss", type=float, default=1.0)
+
+parser.add_argument("--heatmap_size", type=float, default=0.1)
+parser.add_argument("--temperature", type=float, default=0.001)
+
+parser.add_argument("--key_point_num", type=int, default=8)
+parser.add_argument("--stdev", type=float, default=0.1)
+parser.add_argument("--lr", type=float, default=1e-3)
+parser.add_argument("--optimizer", type=str, default="radam")
+parser.add_argument("--max_norm", type=float, default=1.0)
+
+parser.add_argument("--log_dir", default="log/")
+parser.add_argument("--vmin", type=float, default=0.1)
+parser.add_argument("--vmax", type=float, default=0.9)
+parser.add_argument("--device", type=int, default=0)
+parser.add_argument("--tag", help="Tag name for snap/log sub directory")
+args = parser.parse_args()
+
+# check args
+args = check_args(args)
+
+# calculate the noise level (variance) from the normalized range
+stdev = args.stdev * (args.vmax - args.vmin)
+
+# set device id
+if args.device >= 0:
+    device = "cuda:{}".format(args.device)
+else:
+    device = "cpu"
+
+# load train data
+minmax = [args.vmin, args.vmax]
+
+data_dir_path = "/home/fujita/job/2023/airec_hang_suit/rosbag/HangSuit_task2_1"
+# img
+_left_img_data = np.load(f"{data_dir_path}/train/left_img.npy")
+_left_img_data = resize_img(_left_img_data, (128, 128))
+_left_img_data = np.transpose(_left_img_data, (0,1,4,2,3))
+left_img_data = normalization(_left_img_data, (0,255), (args.vmin, args.vmax))
+
+_right_img_data = np.load(f"{data_dir_path}/train/right_img.npy")
+_right_img_data = resize_img(_right_img_data, (128, 128))
+_right_img_data = np.transpose(_right_img_data, (0,1,4,2,3))
+right_img_data = normalization(_right_img_data, (0,255), (args.vmin, args.vmax))
+
+# joint
+arm_joint_bounds = np.load(f"{data_dir_path}/param/arm_joint_bounds.npy")
+# arm_joint, only right
+_arm_joint_data = np.load(f"{data_dir_path}/train/joint_state.npy")
+arm_joint_data = normalization(_arm_joint_data, arm_joint_bounds, (args.vmin, args.vmax))[:,:,7:]
+
+# hand_cmds, only right
+# _left_hand_cmd_data = np.load(f"{data_dir_path}/train/left_hand.npy")
+# _right_hand_cmd_data = np.load(f"{data_dir_path}/train/right_hand.npy")
+# _hand_cmd_data = np.concatenate([_left_hand_cmd_data,
+#                                      _right_hand_cmd_data], axis=-1)
+# hand_cmd_data = np.apply_along_axis(cos_interpolation, 1, 
+#                                         _hand_cmd_data, step=10)[:,:,[11,12,13]]
+_hand_cmd_data = np.load(f"{data_dir_path}/train/hand_cmd.npy")
+hand_cmd_data = np.apply_along_axis(cos_interpolation, 1, 
+                                        _hand_cmd_data, step=10)
+# plt.figure()
+# for i in range(hand_cmd_data.shape[-1]):
+#     if not np.all(hand_cmd_data[0,:,i] == 0):
+#         plt.plot(hand_cmd_data[0,:,i], label=f"idx_{i}")
+# plt.legend()
+# plt.savefig("./fig/prosessed_hand_cmd_data.png")
+
+train_dataset = MultimodalDataset(left_img_data, 
+                                  right_img_data,
+                                  arm_joint_data, 
+                                  hand_cmd_data, 
+                                  stdev=stdev, training=True)
+train_loader = torch.utils.data.DataLoader(
+    train_dataset, 
+    batch_size=args.batch_size, 
+    shuffle=True, 
+    num_workers=2,
+    drop_last=False, 
+    pin_memory=True
+)
+
+print("---train---")
+print("left_img_data: ", left_img_data.shape, left_img_data.min(), left_img_data.max())
+print("right_img_data: ", right_img_data.shape, right_img_data.min(), right_img_data.max())
+print("arm_joint_data: ", arm_joint_data.shape, arm_joint_data.min(), arm_joint_data.max())
+print("hand_cmd_data:", hand_cmd_data.shape, hand_cmd_data.min(), hand_cmd_data.max())
+
+
+
+# load test data
+# img
+_left_img_data = np.load(f"{data_dir_path}/test/left_img.npy")
+_left_img_data = resize_img(_left_img_data, (128, 128))
+_left_img_data = np.transpose(_left_img_data, (0,1,4,2,3))
+left_img_data = normalization(_left_img_data, (0,255), (args.vmin, args.vmax))
+
+_right_img_data = np.load(f"{data_dir_path}/test/right_img.npy")
+_right_img_data = resize_img(_right_img_data, (128, 128))
+_right_img_data = np.transpose(_right_img_data, (0,1,4,2,3))
+right_img_data = normalization(_right_img_data, (0,255), (args.vmin, args.vmax))
+
+# joint
+# arm_joint
+_arm_joint_data = np.load(f"{data_dir_path}/test/joint_state.npy")
+arm_joint_data = normalization(_arm_joint_data, arm_joint_bounds, (args.vmin, args.vmax))[:,:,7:]
+
+# hand_cmds
+# _left_hand_cmd_data = np.load(f"{data_dir_path}/test/left_hand.npy")
+# _right_hand_cmd_data = np.load(f"{data_dir_path}/test/right_hand.npy")
+# _hand_cmd_data = np.concatenate([_left_hand_cmd_data,
+#                                    _right_hand_cmd_data], axis=-1)
+# hand_cmd_data = np.apply_along_axis(cos_interpolation, 1, 
+#                                         _hand_cmd_data, step=10)[:,:,[11,12,13]]
+_hand_cmd_data = np.load(f"{data_dir_path}/test/hand_cmd.npy")
+hand_cmd_data = np.apply_along_axis(cos_interpolation, 1, 
+                                        _hand_cmd_data, step=10)
+
+test_dataset = MultimodalDataset(left_img_data,
+                                 right_img_data,
+                                 arm_joint_data, 
+                                 hand_cmd_data, 
+                                 stdev=stdev, training=False)
+test_loader = torch.utils.data.DataLoader(
+    test_dataset, 
+    batch_size=args.batch_size, 
+    shuffle=True, 
+    num_workers=2,
+    drop_last=False, 
+    pin_memory=True
+)
+
+print("---test---")
+print("left_img_data: ", left_img_data.shape, left_img_data.min(), left_img_data.max())
+print("right_img_data: ", right_img_data.shape, right_img_data.min(), right_img_data.max())
+print("arm_joint_data: ", arm_joint_data.shape, arm_joint_data.min(), arm_joint_data.max())
+print("hand_cmd_data:", hand_cmd_data.shape, hand_cmd_data.min(), hand_cmd_data.max())
+
+
+model = StereoHierarchicalRNN(srnn_input_dims={"k": args.key_point_num * 2, 
+                                         "v": arm_joint_data.shape[-1], 
+                                         "c": hand_cmd_data.shape[-1]},
+                            srnn_hid_dim=args.srnn_hid_dim,
+                            urnn_hid_dim=args.urnn_hid_dim,
+                            heatmap_size=args.heatmap_size,
+                            temperature=args.temperature)
+
+# set optimizer
+if args.optimizer.casefold() == "adam":
+    optimizer = optim.Adam(model.parameters(), lr=args.lr)
+elif args.optimizer.casefold() == "radam":
+    optimizer = optim.RAdam(model.parameters(), lr=args.lr)
+else:
+    assert False, "Unknown optimizer name {}. please set Adam or RAdam.".format(args.optimizer)
+
+# load trainer/tester class
+loss_w_dic = {"i": args.img_loss,
+              "k": args.key_point_loss, 
+              "v": args.joint_loss, 
+              "c": args.cmd_loss}
+scaler = torch.cuda.amp.GradScaler(init_scale=4096)
+trainer = fullBPTTtrainer(model, 
+                          optimizer, 
+                          scaler, 
+                          args.max_norm, 
+                          loss_w_dic=loss_w_dic, 
+                          device=device)
+scheduler = ReduceLROnPlateau(optimizer, 
+                              mode='min', 
+                              factor=0.1, 
+                              patience=5, 
+                              verbose=True)
+
+
+### training main
+log_dir_path = set_logdir("./" + args.log_dir, args.tag)
+save_name = os.path.join(log_dir_path, "StereoHierarchicalRNN.pth")
+# writer = SummaryWriter(log_dir=log_dir_path, flush_secs=30)
+early_stop = EarlyStopping(patience=1000)
+
+train_loss_list, train_left_img_loss_list, train_right_img_loss_list =  [], [], []
+train_left_key_point_loss_list, train_right_key_point_loss_list = [], []
+train_stereo_enc_key_point_loss_list, train_stereo_dec_key_point_loss_list = [], []
+train_joint_loss_list, train_cmd_loss_list = [], []
+test_loss_list, test_left_img_loss_list, test_right_img_loss_list =  [], [], []
+test_left_key_point_loss_list, test_right_key_point_loss_list = [], []
+test_stereo_enc_key_point_loss_list, test_stereo_dec_key_point_loss_list = [], []
+test_joint_loss_list, test_cmd_loss_list = [], []
+with tqdm(range(args.epoch)) as pbar_epoch:
+    for epoch in pbar_epoch:
+        # train and test
+        train_loss_dic = trainer.process_epoch(train_loader)
+        test_loss_dic = trainer.process_epoch(test_loader, training=False)
+        # writer.add_scalar("Loss/train_loss", train_loss, epoch)
+        # writer.add_scalar("Loss/test_loss", test_loss, epoch)
+
+        # train_loss_list.append(train_loss)
+        # test_loss_list.append(test_loss)
+        train_loss_list.append(train_loss_dic["total_loss"])
+        train_left_img_loss_list.append(train_loss_dic["total_left_img_loss"])
+        train_right_img_loss_list.append(train_loss_dic["total_right_img_loss"])
+        train_left_key_point_loss_list.append(train_loss_dic["total_left_key_point_loss"])
+        train_right_key_point_loss_list.append(train_loss_dic["total_right_key_point_loss"])
+        train_stereo_enc_key_point_loss_list.append(train_loss_dic["total_stereo_enc_key_point_loss"])
+        train_stereo_dec_key_point_loss_list.append(train_loss_dic["total_stereo_dec_key_point_loss"])
+        train_joint_loss_list.append(train_loss_dic["total_joint_loss"])
+        train_cmd_loss_list.append(train_loss_dic["total_cmd_loss"])
+        
+        test_loss_list.append(test_loss_dic["total_loss"])
+        test_left_img_loss_list.append(test_loss_dic["total_left_img_loss"])
+        test_right_img_loss_list.append(test_loss_dic["total_right_img_loss"])
+        test_left_key_point_loss_list.append(test_loss_dic["total_left_key_point_loss"])
+        test_right_key_point_loss_list.append(test_loss_dic["total_right_key_point_loss"])
+        test_stereo_enc_key_point_loss_list.append(test_loss_dic["total_stereo_enc_key_point_loss"])
+        test_stereo_dec_key_point_loss_list.append(test_loss_dic["total_stereo_dec_key_point_loss"])
+        test_joint_loss_list.append(test_loss_dic["total_joint_loss"])
+        test_cmd_loss_list.append(test_loss_dic["total_cmd_loss"])
+
+        # early stop
+        save_ckpt, _ = early_stop(test_loss_dic["total_loss"])
+
+        scheduler.step(test_loss_dic["total_loss"])
+        
+        if save_ckpt:
+            trainer.save(epoch, [train_loss_dic["total_loss"], test_loss_dic["total_loss"]], save_name)
+
+        # print process bar
+        pbar_epoch.set_postfix(OrderedDict( train_loss=train_loss_dic["total_loss"],
+                                            test_loss=test_loss_dic["total_loss"]))
+
+# fig = plt.figure()
+# plt.plot(range(args.epoch), train_loss_list, linestyle='dashed', c='r', label="train loss")
+# plt.plot(range(args.epoch), test_loss_list, linestyle='dashed', c='k', label="test loss")
+# plt.grid()
+# plt.legend(bbox_to_anchor=(1, 1), loc='upper right', borderaxespad=0) # fontsize=18
+# plt.savefig(f'{log_dir_path}/loss_trend.png')
+# plt.clf()
+# plt.close()
+fig, ax = plt.subplots(1, 3, figsize=(20, 8), dpi=60)
+for i in range(3):
+    ax[i].cla()
+
+ax[0].plot(range(len(train_loss_list)), train_loss_list, label="train")
+ax[0].plot(range(len(test_loss_list)), test_loss_list, label="test")
+ax[0].grid()
+ax[0].legend(bbox_to_anchor=(1, 1), loc='upper right', borderaxespad=0) # fontsize=18
+ax[0].set_title("total loss")
+
+ax[1].plot(range(len(train_left_img_loss_list)), train_left_img_loss_list, label="left_image")
+ax[1].plot(range(len(train_right_img_loss_list)), train_right_img_loss_list, label="right_image")
+ax[1].plot(range(len(train_left_key_point_loss_list)), train_left_key_point_loss_list, label="left_key_point")
+ax[1].plot(range(len(train_right_key_point_loss_list)), train_right_key_point_loss_list, label="right_key_point")
+ax[1].plot(range(len(train_stereo_enc_key_point_loss_list)), train_stereo_enc_key_point_loss_list, label="stereo_enc_key_point")
+ax[1].plot(range(len(train_stereo_dec_key_point_loss_list)), train_stereo_dec_key_point_loss_list, label="stereo_dec_key_point")
+ax[1].plot(range(len(train_joint_loss_list)), train_joint_loss_list, label="joint")
+ax[1].plot(range(len(train_cmd_loss_list)), train_cmd_loss_list, label="command")
+ax[1].grid()
+ax[1].legend(bbox_to_anchor=(1, 1), loc='upper right', borderaxespad=0) # fontsize=18
+ax[1].set_title("train data loss")
+
+ax[2].plot(range(len(test_left_img_loss_list)), test_left_img_loss_list, label="left_image")
+ax[2].plot(range(len(test_right_img_loss_list)), test_right_img_loss_list, label="right_image")
+ax[2].plot(range(len(test_left_key_point_loss_list)), test_left_key_point_loss_list, label="left_key_point")
+ax[2].plot(range(len(test_right_key_point_loss_list)), test_right_key_point_loss_list, label="right_key_point")
+ax[2].plot(range(len(test_stereo_enc_key_point_loss_list)), test_stereo_enc_key_point_loss_list, label="stereo_enc_key_point")
+ax[2].plot(range(len(test_stereo_dec_key_point_loss_list)), test_stereo_dec_key_point_loss_list, label="stereo_dec_key_point")
+ax[2].plot(range(len(test_joint_loss_list)), test_joint_loss_list, label="joint")
+ax[2].plot(range(len(test_cmd_loss_list)), test_cmd_loss_list, label="command")
+ax[2].grid()
+ax[2].legend(bbox_to_anchor=(1, 1), loc='upper right', borderaxespad=0) # fontsize=18
+ax[2].set_title("test data loss")
+plt.savefig(f'{log_dir_path}/loss_trend.png')
+plt.clf()
+plt.close()
+
+result = {
+    "hid_size": {"srnn": args.srnn_hid_dim, "urnn": args.urnn_hid_dim},
+    "loss": {"train": train_loss_list[-1], "test": test_loss_list[-1]}
+}
+with open(f'{log_dir_path}/result.json', 'w') as f:
+    json.dump(result, f, indent=2)

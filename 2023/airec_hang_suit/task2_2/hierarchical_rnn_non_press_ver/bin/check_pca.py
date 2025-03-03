@@ -1,0 +1,233 @@
+#
+# Copyright (c) 2023 Ogata Laboratory, Waseda University
+#
+# Released under the AGPL license.
+# see https://www.gnu.org/licenses/agpl-3.0.txt
+#
+import ipdb
+import os
+import sys
+import glob
+import json
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.animation as anim
+from sklearn.decomposition import PCA
+import torch
+import torch.nn as nn
+import argparse
+
+sys.path.append("/home/fujita/work/eipl")
+from eipl.utils import restore_args, tensor2numpy, deprocess_img, normalization, resize_img, cos_interpolation
+
+try:
+    from libs.model import HSARNN
+except:
+    sys.path.append("./libs/")
+    from model import HSARNN
+
+
+# smoothing
+def smoothing(data):
+    N, _, vec = data.shape
+    smoothed_hand = []
+    for i in range(N):
+        _tmp = []
+        for j in range(vec):
+            _tmp.append(cos_interpolation(data[i, :, j])[:, 0])
+        smoothed_hand.append(np.array(_tmp).T)
+
+    return np.array(smoothed_hand)
+
+
+# argument parser
+parser = argparse.ArgumentParser()
+parser.add_argument("state_dir", type=str, default=None)
+# parser.add_argument("--idx", type=int, default=0)
+args = parser.parse_args()
+
+# restore parameters
+ckpt = sorted(glob.glob(os.path.join(args.state_dir, '*.pth')))
+latest = ckpt.pop()
+# dir_name = os.path.split(args.state_dir)[0]
+dir_name = args.state_dir
+day = dir_name.split('/')[-1]
+params = restore_args( os.path.join(dir_name, 'args.json') )
+# idx = args.idx
+
+try:
+    os.makedirs(f'./output/test_idx_{idx}/{params["tag"]}/')    # fast_tau_{int(params["fast_tau"])}/
+except:
+    pass
+
+# load dataset
+minmax = [params["vmin"], params["vmax"]]
+
+data_dir_path = "/home/fujita/job/2023/airec_hang_suit/rosbag/HangSuit_task2_2"
+# test data
+# # img
+# raw_left_img_data = np.load(f"{data_dir_path}/test/left_img.npy")
+# # _left_img_data = np.expand_dims(raw_left_img_data[idx], 0)
+# plt_left_img_data = _left_img_data = resize_img(raw_left_img_data, (params["img_size"], params["img_size"]))
+# _left_img_data = normalization(_left_img_data.astype(np.float32), (0.0, 255.0), minmax)
+# left_img_data = np.transpose(_left_img_data, (0, 1, 4, 2, 3))
+
+raw_right_img_data = np.load(f"{data_dir_path}/test/right_img.npy")
+# _right_img_data = np.expand_dims(raw_right_img_data[idx], 0)
+plt_right_img_data = _right_img_data = resize_img(raw_right_img_data, (params["img_size"], params["img_size"]))
+_right_img_data = normalization(_right_img_data.astype(np.float32), (0.0, 255.0), minmax)
+right_img_data = np.transpose(_right_img_data, (0, 1, 4, 2, 3))
+
+
+# joint bounds
+arm_joint_bounds = np.load(f"{data_dir_path}/param/arm_joint_bounds.npy")
+thresh = 0.02
+for i in range(arm_joint_bounds.shape[1]):
+    if arm_joint_bounds[1,i] - arm_joint_bounds[0,i] < thresh:
+        arm_joint_bounds[0,i] = arm_joint_bounds[0].min()
+        arm_joint_bounds[1,i] = arm_joint_bounds[1].max()
+
+# joint
+raw_arm_joint_data = np.load(f"{data_dir_path}/test/joint_state.npy")
+plt_arm_joint_data = _arm_joint_data = raw_arm_joint_data[:,:,7:]
+# plt_arm_joint_data = _arm_joint_data = np.expand_dims(raw_arm_joint_data[idx], 0)[:,:,7:]
+arm_joint_data = normalization(_arm_joint_data, arm_joint_bounds[:,7:], minmax)
+
+# cmd
+raw_hand_cmd_data = np.load(f"{data_dir_path}/test/hand_cmd.npy")
+# _hand_cmd_data = np.expand_dims(raw_hand_cmd_data[idx], 0)
+tg = []
+to = []
+for i in range(raw_hand_cmd_data.shape[0]):
+    for j in range(raw_hand_cmd_data.shape[2]):
+        if j == 0:
+            pass
+        elif j == 1:
+            tg.append(raw_hand_cmd_data[i,:,j].tolist().index(1))
+        elif j == 2:
+            to.append(raw_hand_cmd_data[i,:,j].tolist().index(1))
+# import ipdb; ipdb.set_trace()
+
+plt_hand_cmd_data = _hand_cmd_data = np.apply_along_axis(cos_interpolation, 1, raw_hand_cmd_data, step=10)
+hand_cmd_data = normalization(_hand_cmd_data, (0.0, 1.0), minmax)
+
+# vector
+vec_data = np.concatenate((arm_joint_data, hand_cmd_data), axis=-1)
+
+print("vector: ", vec_data.min(), vec_data.max())
+# print("image: ", left_img_data.min(), left_img_data.max())
+print("image: ", right_img_data.min(), right_img_data.max())
+
+vec_dim = vec_data.shape[-1]
+
+# define model
+model = HSARNN(
+    # rnn_dim=args.rnn_dim,
+    # union_dim=args.union_dim,
+    srnn_hid_dim = params["srnn_hid_dim"],
+    urnn_hid_dim = params["urnn_hid_dim"],
+    k_dim=params["k_dim"],
+    vec_dim=vec_dim,
+    heatmap_size=params["heatmap_size"],
+    temperature=params["temperature"],
+    img_size=[params["img_size"], params["img_size"]]
+    )
+
+
+if params["compile"]:
+    model = torch.compile(model)
+
+# load weight
+ckpt = torch.load(latest, map_location=torch.device("cpu"))
+model.load_state_dict(ckpt["model_state_dict"])
+model.eval()
+
+# Inference
+loss_w_dic = {"i": params["img_loss"],
+              "k": params["pt_loss"], 
+              "v": params["vec_loss"]}
+
+# image: numpy to tensor
+# x_left_img = y_left_img = torch.from_numpy(left_img_data).float()
+x_right_img = y_right_img = torch.from_numpy(right_img_data).float()
+# joint: numpy to tensor
+x_vec = y_vec = torch.from_numpy(vec_data).float()
+
+states = None
+urnn_state_list = []
+img_size = params["img_size"]
+T = x_right_img.shape[1]
+for t in range(T-1):
+    # load data and normalization
+    # img_t = images[loop_ct].transpose(2, 0, 1)
+    # img_t = torch.Tensor(np.expand_dims(img_t, 0))
+    # img_t = normalization(img_t, (0, 255), minmax)
+    # joint_t = torch.Tensor(np.expand_dims(joints[loop_ct], 0))
+    
+    # predict rnn
+    # y_image, y_joint, ect_pts, dec_pts, states = model(img_t, joint_t, state)
+    [yri_hat, yv_hat, right_enc_pts, right_dec_pts, states] = model(
+        x_right_img[:, t], x_vec[:, t], states
+    )
+    [right_ksrnn_state, vsrnn_state, urnn_state] = states # psrnn_state, 
+    urnn_state_list.append(urnn_state[0])
+    # print("step:{}, vec:{}".format(t, yv_hat))    x_left_img[:, t], yli_hat, left_enc_pts, left_dec_pts, left_ksrnn_state, 
+
+urnn_states = torch.permute(torch.stack(urnn_state_list), (1, 0, 2))
+urnn_states = tensor2numpy(urnn_states)
+
+# ######
+# urnn_states = arm_joint_data[:,1:]
+urnn_states = urnn_states[:,10:]
+# ######
+
+# Reshape the state from [N,T,D] to [-1,D] for PCA of RNN.
+# N is the number of datasets
+# T is the sequence length
+# D is the dimension of the hidden state
+N, T, D = urnn_states.shape
+urnn_states = urnn_states.reshape(-1, D)
+# PCA
+loop_ct = float(360) / T
+pca_dim = 3
+pca = PCA(n_components=pca_dim).fit(urnn_states)
+pca_val = pca.transform(urnn_states)
+# Reshape the states from [-1, pca_dim] to [N,T,pca_dim] to
+# visualize each state as a 3D scatter.
+pca_val = pca_val.reshape(N, T, pca_dim)
+
+# plot images
+fig = plt.figure()  # dpi=60
+ax = fig.add_subplot(projection="3d")
+
+def anim_update(i):
+    ax.cla()
+    angle = int(loop_ct * i)
+    ax.view_init(30, angle)
+
+    # c_list = ["C0", "C1", "C2", "C3", "C4", "C5", "C6"]
+    # for n, color in enumerate(c_list):
+    #     ax.scatter(
+    #         pca_val[n, 1:, 0], pca_val[n, 1:, 1], pca_val[n, 1:, 2], color=color, s=3.0
+    #     )
+    
+    for n in range(7):
+        ax.scatter(
+            pca_val[n, 1:tg[n], 0], pca_val[n, 1:tg[n], 1], pca_val[n, 1:tg[n], 2], color="C0", s=3.0
+        )
+        ax.scatter(
+            pca_val[n, tg[n]:to[n], 0], pca_val[n, tg[n]:to[n], 1], pca_val[n, tg[n]:to[n], 2], color="C1", s=3.0
+        )
+        ax.scatter(
+            pca_val[n, to[n]:, 0], pca_val[n, to[n]:, 1], pca_val[n, to[n]:, 2], color="C2", s=3.0
+        )
+
+    ax.scatter(pca_val[n, 0, 0], pca_val[n, 0, 1], pca_val[n, 0, 2], color="k", s=30.0)
+    pca_ratio = pca.explained_variance_ratio_ * 100
+    ax.set_xlabel("PC1 ({:.1f}%)".format(pca_ratio[0]))
+    ax.set_ylabel("PC2 ({:.1f}%)".format(pca_ratio[1]))
+    ax.set_zlabel("PC3 ({:.1f}%)".format(pca_ratio[2]))
+
+ani = anim.FuncAnimation(fig, anim_update, interval=int(np.ceil(T / 10)), frames=T)
+# ani.save("./output/PCA_SARNN_{}.gif".format(params["tag"]))
+ani.save(f'./output/PCA_HSARNN_{params["tag"]}.gif')
