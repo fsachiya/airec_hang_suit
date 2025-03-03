@@ -1,0 +1,14 @@
+{
+    "device": 0,
+    "epoch": 1000,
+    "log_dir": "log/",
+    "lr": 0.01,
+    "model": "mtrnn",
+    "optimizer": "radam",
+    "plt_show_flag": false,
+    "state_path": null,
+    "tag": "20240416_2104_13",
+    "total_step": 200,
+    "vmax": 1.0,
+    "vmin": 0.0
+}
